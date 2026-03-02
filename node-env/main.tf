@@ -10,35 +10,20 @@ terraform {
   }
 }
 
-provider "docker" {}
+locals {
+  username = data.coder_workspace_owner.me.name
+}
 
+provider "docker" {}
 provider "coder" {}
 
 data "coder_provisioner" "me" {}
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 
-# Paramètres affichés à la création du workspace
 variable "dotfiles_uri" {
   description = "URL d'un repo dotfiles à cloner (laisser vide pour ignorer)"
   default     = ""
-}
-
-# code-server (VS Code dans le navigateur)
-resource "coder_app" "code_server" {
-  agent_id     = coder_agent.main.id
-  slug         = "code-server"
-  display_name = "VS Code"
-  url          = "http://localhost:8080/?folder=/home/coder"
-  icon         = "/icon/code.svg"
-  subdomain    = false
-  share        = "owner"
-
-  healthcheck {
-    url       = "http://localhost:8080/healthz"
-    interval  = 5
-    threshold = 6
-  }
 }
 
 resource "coder_agent" "main" {
@@ -47,115 +32,110 @@ resource "coder_agent" "main" {
   startup_script = <<-EOT
     set -e
 
-    # code-server
-    if ! command -v code-server &>/dev/null; then
-      curl -fsSL https://code-server.dev/install.sh | sh
+    if [ ! -f ~/.init_done ]; then
+      cp -rT /etc/skel ~
+      touch ~/.init_done
     fi
-    code-server --auth none --port 8080 &
 
-    # dotfiles
+    curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/tmp/code-server
+    /tmp/code-server/bin/code-server --auth none --port 13337 >/tmp/code-server.log 2>&1 &
+
     if [ -n "${var.dotfiles_uri}" ]; then
       coder dotfiles -y "${var.dotfiles_uri}"
     fi
 
-    # Node.js via nvm
-    if ! command -v nvm &>/dev/null; then
-      curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-      export NVM_DIR="$HOME/.nvm"
-      source "$NVM_DIR/nvm.sh"
-      nvm install --lts
-      nvm use --lts
-      npm install -g typescript ts-node pnpm
-    fi
+    export NVM_DIR="$HOME/.nvm"
+    [ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
   EOT
 
+  env = {
+    GIT_AUTHOR_NAME     = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
+    GIT_AUTHOR_EMAIL    = data.coder_workspace_owner.me.email
+    GIT_COMMITTER_NAME  = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
+    GIT_COMMITTER_EMAIL = data.coder_workspace_owner.me.email
+  }
+
   metadata {
-    display_name = "CPU"
-    key          = "cpu"
+    display_name = "CPU Usage"
+    key          = "0_cpu_usage"
     script       = "coder stat cpu"
     interval     = 10
     timeout      = 1
   }
 
   metadata {
-    display_name = "RAM"
-    key          = "ram"
+    display_name = "RAM Usage"
+    key          = "1_ram_usage"
     script       = "coder stat mem"
     interval     = 10
     timeout      = 1
   }
 
   metadata {
-    display_name = "Disk"
-    key          = "disk"
-    script       = "coder stat disk"
+    display_name = "Home Disk"
+    key          = "3_home_disk"
+    script       = "coder stat disk --path $${HOME}"
     interval     = 60
     timeout      = 1
   }
 }
 
-# Image Docker avec Docker-in-Docker
+resource "coder_app" "code_server" {
+  agent_id     = coder_agent.main.id
+  slug         = "code-server"
+  display_name = "VS Code"
+  url          = "http://localhost:13337/?folder=/home/${local.username}"
+  icon         = "/icon/code.svg"
+  subdomain    = false
+  share        = "owner"
+
+  healthcheck {
+    url       = "http://localhost:13337/healthz"
+    interval  = 5
+    threshold = 6
+  }
+}
+
 resource "docker_image" "node_env" {
-  name = "node-env-coder"
+  name = "coder-${data.coder_workspace.me.id}"
+
   build {
     context = "${path.module}/build"
+    build_args = {
+      USER = local.username
+    }
   }
+
   triggers = {
-    dockerfile = filemd5("${path.module}/build/Dockerfile")
+    dir_sha1 = sha1(join("", [for f in fileset(path.module, "build/*") : filesha1(f)]))
   }
 }
 
 resource "docker_container" "workspace" {
-  count = data.coder_workspace.me.start_count
-  image = docker_image.node_env.image_id
-  name  = "coder-${data.coder_workspace_owner.me.name}-${data.coder_workspace.me.name}"
+  count    = data.coder_workspace.me.start_count
+  image    = docker_image.node_env.name
+  name     = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}"
+  hostname = data.coder_workspace.me.name
 
-  # Docker-in-Docker
-  privileged = true
+  entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "host.docker.internal")]
 
-  env = [
-    "CODER_AGENT_TOKEN=${coder_agent.main.token}",
-  ]
-
-  command = [
-    "sh", "-c",
-    <<-EOT
-      # Démarrer le daemon Docker
-      dockerd &
-      # Démarrer l'agent Coder
-      exec /usr/bin/coder agent
-    EOT
-  ]
-
-  volumes {
-    container_path = "/home/coder"
-    volume_name    = docker_volume.home.name
-    read_only      = false
-  }
-
-  volumes {
-    container_path = "/var/lib/docker"
-    volume_name    = docker_volume.docker_data.name
-    read_only      = false
-  }
+  env = ["CODER_AGENT_TOKEN=${coder_agent.main.token}"]
 
   host {
     host = "host.docker.internal"
     ip   = "host-gateway"
   }
-}
 
-# Volume persistant pour le home
-resource "docker_volume" "home" {
-  name = "coder-${data.coder_workspace_owner.me.name}-${data.coder_workspace.me.name}-home"
-  lifecycle {
-    ignore_changes = all
+  volumes {
+    container_path = "/home/${local.username}"
+    volume_name    = docker_volume.home.name
+    read_only      = false
   }
 }
 
-# Volume persistant pour les images Docker (DinD)
-resource "docker_volume" "docker_data" {
-  name = "coder-${data.coder_workspace_owner.me.name}-${data.coder_workspace.me.name}-docker"
+resource "docker_volume" "home" {
+  name = "coder-${data.coder_workspace.me.id}-home"
+
   lifecycle {
     ignore_changes = all
   }
