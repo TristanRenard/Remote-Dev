@@ -27,26 +27,8 @@ variable "dotfiles_uri" {
 }
 
 resource "coder_agent" "main" {
-  arch           = data.coder_provisioner.me.arch
-  os             = "linux"
-  startup_script = <<-EOT
-    set -e
-
-    if [ ! -f ~/.init_done ]; then
-      cp -rT /etc/skel ~
-      touch ~/.init_done
-    fi
-
-    curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/tmp/code-server
-    /tmp/code-server/bin/code-server --auth none --port 13337 >/tmp/code-server.log 2>&1 &
-
-    if [ -n "${var.dotfiles_uri}" ]; then
-      coder dotfiles -y "${var.dotfiles_uri}"
-    fi
-
-    export NVM_DIR="$HOME/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
-  EOT
+  arch = data.coder_provisioner.me.arch
+  os   = "linux"
 
   env = {
     GIT_AUTHOR_NAME     = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
@@ -78,6 +60,39 @@ resource "coder_agent" "main" {
     interval     = 60
     timeout      = 1
   }
+}
+
+resource "coder_script" "code_server" {
+  agent_id     = coder_agent.main.id
+  display_name = "code-server"
+  icon         = "/icon/code.svg"
+  run_on_start = true
+  script       = <<-EOT
+    #!/bin/bash
+    set -e
+    curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/tmp/code-server
+    /tmp/code-server/bin/code-server --auth none --port 13337 >/tmp/code-server.log 2>&1 &
+  EOT
+}
+
+resource "coder_script" "dotfiles" {
+  agent_id     = coder_agent.main.id
+  display_name = "Dotfiles"
+  icon         = "/icon/dotfiles.svg"
+  run_on_start = true
+  script       = <<-EOT
+    #!/bin/bash
+    # Initialiser le home si nécessaire
+    if [ ! -f ~/.init_done ]; then
+      cp -rT /etc/skel ~ 2>/dev/null || true
+      touch ~/.init_done
+    fi
+
+    # Dotfiles (si configuré)
+    if [ -n "${var.dotfiles_uri}" ]; then
+      coder dotfiles -y "${var.dotfiles_uri}"
+    fi
+  EOT
 }
 
 resource "coder_app" "code_server" {
