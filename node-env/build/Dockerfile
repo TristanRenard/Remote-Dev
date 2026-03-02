@@ -4,7 +4,6 @@ SHELL ["/bin/bash", "-c"]
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NVM_DIR=/home/coder/.nvm
-ENV PATH=$NVM_DIR/versions/node/$(cat $NVM_DIR/alias/default 2>/dev/null || echo "")/bin:$PATH
 
 # Dépendances système
 RUN apt-get update && apt-get install -y \
@@ -37,7 +36,7 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 RUN curl -fsSL https://coder.com/install.sh | sh
 
 # Utilisateur coder
-RUN useradd -m -s /bin/bash coder \
+RUN id -u coder &>/dev/null || useradd -m -s /bin/bash coder \
   && echo "coder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
   && usermod -aG docker coder
 
